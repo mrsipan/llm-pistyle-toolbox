@@ -345,3 +345,9 @@ class PiMonoStyleToolbox(llm.Toolbox):
                 f"Path {user_path} would escape workspace {self.workspace}"
                 )
         return candidate
+
+
+@llm.hookimpl
+def register_tools(register):
+    """Register the toolbox with the LLM plugin system."""
+    register(PiMonoStyleToolbox)
