@@ -1,11 +1,10 @@
 import difflib
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import llm
 
@@ -13,18 +12,15 @@ import llm
 class PiMonoStyleToolbox(llm.Toolbox):
     """
     A toolbox that mimics Pi‑mono’s core tools (read, write, edit, bash),
-    but runs scripts with xonsh instead of plain sh.
-
-    Additionally provides an advanced `edit_diff` tool that accepts either:
-      - Standard unified diff (produced by `diff -u`)
-      - SEARCH/REPLACE blocks (as used by Aider)
+    but with two script runners: one for xonsh and one for sh/bash.
+    Also provides advanced diff‑based editing with SEARCH/REPLACE blocks.
     """
     def __init__(self, workspace_dir: Optional[str] = None):
         super().__init__()
         self.workspace = Path(workspace_dir
                              ) if workspace_dir else Path.cwd()
         self.workspace.mkdir(parents=True, exist_ok=True)
-        self._last_xonsh_output = ""
+        self._last_command_output = ""
 
     # -------------------------------------------------------------------------
     # 1) Read a file (optionally with line range)
@@ -121,7 +117,6 @@ class PiMonoStyleToolbox(llm.Toolbox):
         if not full_path.is_file():
             return f"Error: {full_path} does not exist."
 
-        # Detect format and normalise to unified diff if possible
         if self._looks_like_search_replace(diff):
             unified = self._convert_search_replace_to_unified(
                 full_path, diff
@@ -130,7 +125,6 @@ class PiMonoStyleToolbox(llm.Toolbox):
                 return "Error: Could not parse SEARCH/REPLACE blocks. Ensure each block has <<<<<<< SEARCH, =======, and >>>>>>> REPLACE markers."
             diff = unified
 
-        # Apply unified diff
         try:
             original_lines = full_path.read_text(
                 encoding="utf-8"
@@ -141,7 +135,6 @@ class PiMonoStyleToolbox(llm.Toolbox):
             if patched_lines is None:
                 return "Error: Failed to apply unified diff. Hunk(s) did not match the current file content."
 
-            # Write back
             full_path.write_text(
                 "".join(patched_lines), encoding="utf-8"
                 )
@@ -160,45 +153,24 @@ class PiMonoStyleToolbox(llm.Toolbox):
         and return its stdout + stderr.
         If `filename` is provided, the script is saved permanently in the workspace.
         """
-        if filename:
-            script_path = self._safe_path(filename)
-            script_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            fd, tmp_name = tempfile.mkstemp(suffix=".xsh", text=True)
-            os.close(fd)
-            script_path = Path(tmp_name)
+        return self._run_script(
+            script, filename, interpreter="xonsh", suffix=".xsh"
+            )
 
-        try:
-            script_path.write_text(script, encoding="utf-8")
-            script_path.chmod(0o755)
-
-            result = subprocess.run(
-                ["xonsh", str(script_path)],
-                cwd=str(self.workspace),
-                capture_output=True,
-                text=True,
-                check=False,
-                )
-
-            output = result.stdout
-            if result.stderr:
-                output += f"\n[STDERR]\n{result.stderr}"
-            if result.returncode != 0:
-                output += f"\n[EXIT CODE] {result.returncode}"
-
-            self._last_xonsh_output = output
-            return output.strip()
-
-        except FileNotFoundError:
-            return (
-                "Error: 'xonsh' executable not found. "
-                "Please install xonsh (pip install xonsh) and ensure it is on your PATH."
-                )
-        except Exception as e:
-            return f"Error during script execution: {e}"
-        finally:
-            if not filename and script_path.exists():
-                script_path.unlink()
+    # -------------------------------------------------------------------------
+    # 6) Run a sh/bash script
+    # -------------------------------------------------------------------------
+    def sh_run(
+        self, script: str, filename: Optional[str] = None
+        ) -> str:
+        """
+        Write the given shell script (sh/bash) to a temporary .sh file, execute it,
+        and return its stdout + stderr.
+        If `filename` is provided, the script is saved permanently in the workspace.
+        """
+        return self._run_script(
+            script, filename, interpreter="sh", suffix=".sh"
+            )
 
     # -------------------------------------------------------------------------
     # Internal helpers for diff handling
@@ -217,13 +189,11 @@ class PiMonoStyleToolbox(llm.Toolbox):
         Parse SEARCH/REPLACE blocks and produce a unified diff.
         Returns None on parse error.
         """
-        # Split into blocks using the markers
         blocks = re.split(r'\n?<<<<<<< SEARCH\n', block_text)
         if len(blocks) < 2:
             return None
 
         unified_diff_lines = []
-        # First element is empty or garbage before first block, skip
         for block in blocks[1:]:
             if '=======' not in block or '>>>>>>> REPLACE' not in block:
                 return None
@@ -233,39 +203,20 @@ class PiMonoStyleToolbox(llm.Toolbox):
             search_lines = search_part.strip('\n').splitlines()
             replace_lines = replace_part.strip('\n').splitlines()
 
-            # Build unified diff hunk for this block
-            # We need to locate the search block in the current file content
             current = file_path.read_text(encoding="utf-8").splitlines()
-            matcher = difflib.SequenceMatcher(
-                None, current, search_lines
-                )
-            # Find the best match
+            # Locate the search block
             match = None
-            for block_match in matcher.get_matching_blocks():
-                # block_match is (start in current, start in search, length)
-                if block_match.size == len(search_lines):
-                    # perfect match
-                    match = (block_match.a, block_match.size)
+            for i in range(len(current) - len(search_lines) + 1):
+                if current[i:i + len(search_lines)] == search_lines:
+                    match = (i, len(search_lines))
                     break
             if match is None:
-                # try fuzzy: find a block that contains the search lines as substring
-                # (simpler: just use difflib to find first approximate location)
-                for i in range(len(current) - len(search_lines) + 1):
-                    if current[i:i + len(search_lines)] == search_lines:
-                        match = (i, len(search_lines))
-                        break
-            if match is None:
-                return None  # cannot locate the exact block
+                return None
 
             start_line, length = match
-            # Create unified diff format manually
-            from_line_start = start_line + 1
-            to_line_start = start_line + 1
             unified_diff_lines.append(
-                f"@@ -{from_line_start},{length} +{to_line_start},{len(replace_lines)} @@"
+                f"@@ -{start_line+1},{length} +{start_line+1},{len(replace_lines)} @@"
                 )
-            # Add context lines around? We'll just output the changes (simplified)
-            # For simplicity, we output the search lines with '-' and replace lines with '+'
             for line in search_lines:
                 unified_diff_lines.append(f"-{line}")
             for line in replace_lines:
@@ -276,20 +227,12 @@ class PiMonoStyleToolbox(llm.Toolbox):
     def _apply_unified_diff(
         self, original_lines: List[str], diff_text: str
         ) -> Optional[List[str]]:
-        """
-        Apply a unified diff to a list of lines. Returns patched lines or None if failure.
-        Uses difflib's unified diff parser logic.
-        """
-        # We'll implement a simple but robust patch application
-        # Parse diff hunks
+        """Apply unified diff to original_lines. Returns patched lines or None."""
         diff_lines = diff_text.splitlines()
-        result = original_lines[:]
-        # We'll process hunks in reverse order to avoid line number shifts
         hunks = []
         current_hunk = None
         for line in diff_lines:
             if line.startswith('@@'):
-                # Parse header: @@ -old_start,old_count +new_start,new_count @@
                 match = re.match(
                     r'^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@', line
                     )
@@ -315,15 +258,13 @@ class PiMonoStyleToolbox(llm.Toolbox):
                     current_hunk['lines'].append(('+', line[1:]))
                 elif line.startswith(' '):
                     current_hunk['lines'].append((' ', line[1:]))
-                # ignore other lines (like diff headers)
 
         if not hunks:
-            return None  # no valid hunks
+            return None
 
-        # Apply hunks in reverse order (so line numbers don't shift)
+        result = original_lines[:]
         for hunk in reversed(hunks):
-            old_start = hunk['old_start'] - 1  # zero-index
-            # Verify context
+            old_start = hunk['old_start'] - 1
             ok = True
             idx = old_start
             for op, text in hunk['lines']:
@@ -333,23 +274,65 @@ class PiMonoStyleToolbox(llm.Toolbox):
                         ok = False
                         break
                     idx += 1
-                # for '+' we don't check original
             if not ok:
-                return None  # hunk mismatch
+                return None
 
-            # Build new segment
             new_segment = []
             idx = old_start
             for op, text in hunk['lines']:
                 if op == ' ' or op == '-':
-                    idx += 1  # skip original line (if op '-', it's removed)
+                    idx += 1
                 if op == '+':
                     new_segment.append(text + '\n')
-            # Replace the block
             result = result[:old_start] + new_segment + result[
                 old_start + hunk['old_count']:]
 
         return result
+
+    # -------------------------------------------------------------------------
+    # Common script runner (internal)
+    # -------------------------------------------------------------------------
+    def _run_script(
+        self, script: str, filename: Optional[str], interpreter: str,
+        suffix: str
+        ) -> str:
+        """Generic script runner for any interpreter."""
+        if filename:
+            script_path = self._safe_path(filename)
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            fd, tmp_name = tempfile.mkstemp(suffix=suffix, text=True)
+            os.close(fd)
+            script_path = Path(tmp_name)
+
+        try:
+            script_path.write_text(script, encoding="utf-8")
+            script_path.chmod(0o755)
+
+            result = subprocess.run(
+                [interpreter, str(script_path)],
+                cwd=str(self.workspace),
+                capture_output=True,
+                text=True,
+                check=False,
+                )
+
+            output = result.stdout
+            if result.stderr:
+                output += f"\n[STDERR]\n{result.stderr}"
+            if result.returncode != 0:
+                output += f"\n[EXIT CODE] {result.returncode}"
+
+            self._last_command_output = output
+            return output.strip()
+
+        except FileNotFoundError:
+            return f"Error: '{interpreter}' executable not found. Please install it and ensure it is on your PATH."
+        except Exception as e:
+            return f"Error during script execution: {e}"
+        finally:
+            if not filename and script_path.exists():
+                script_path.unlink()
 
     # -------------------------------------------------------------------------
     # Helper: resolve path safely
@@ -362,8 +345,3 @@ class PiMonoStyleToolbox(llm.Toolbox):
                 f"Path {user_path} would escape workspace {self.workspace}"
                 )
         return candidate
-
-
-@llm.hookimpl
-def register_tools(register):
-    register(PiMonoStyleToolbox)
